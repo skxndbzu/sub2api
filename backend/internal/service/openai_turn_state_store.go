@@ -28,6 +28,7 @@ func (c OpenAITurnStateControl) sameGeneration(other OpenAITurnStateControl) boo
 type OpenAITurnStateRecord struct {
 	OpenAITurnStateKey
 	State           string    `json:"state"`
+	IssuedAt        time.Time `json:"issued_at"`
 	ProbedAt        time.Time `json:"probed_at"`
 	ExpiresAt       time.Time `json:"expires_at"`
 	RefreshAt       time.Time `json:"refresh_at"`
@@ -71,6 +72,7 @@ type OpenAITurnStateStatus struct {
 	Enabled          bool                `json:"enabled"`
 	Meta             OpenAITurnStateMeta `json:"probe"`
 	ProbedAt         *time.Time          `json:"probed_at,omitempty"`
+	IssuedAt         *time.Time          `json:"issued_at,omitempty"`
 	ExpiresAt        *time.Time          `json:"expires_at,omitempty"`
 	RemainingSeconds int64               `json:"remaining_seconds"`
 	SourceProxyID    int64               `json:"source_proxy_id,omitempty"`

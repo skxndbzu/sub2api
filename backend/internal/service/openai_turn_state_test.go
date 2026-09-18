@@ -67,7 +67,7 @@ func TestOpenAITurnStateHTTPPriorityMappingAndAccountRetry(t *testing.T) {
 	b := otsAccount(2)
 	ctx := context.Background()
 	key := OpenAITurnStateKey{1, "model-a", "priority"}
-	value := strings.Repeat("z", 292)
+	value := otsTestToken(time.Now(), 'z')
 	store := &otsTestStore{records: map[OpenAITurnStateKey]*OpenAITurnStateRecord{key: {State: value, StateLength: 292, StateDigest: turnStateDigest(value), ExpiresAt: time.Now().Add(time.Hour), Generation: "v1"}}}
 	gateway := &OpenAIGatewayService{}
 	svc := NewOpenAITurnStateService(store, &otsTestAccounts{account: a}, nil, gateway)
@@ -119,75 +119,88 @@ func (s *otsLocalUpstream) DoWithTLS(r *http.Request, p string, a int64, c int, 
 }
 
 func TestOpenAITurnStateProbeSelects292AndClosesStream(t *testing.T) {
-	var mu sync.Mutex
-	var bodies [][]byte
-	var seenStates []string
-	closed := make(chan struct{}, 3)
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path == "/cdn-cgi/trace" {
-			if strings.Contains(r.Header.Get("X-Test-Proxy"), "node1") {
-				_, _ = io.WriteString(w, "ip=203.0.113.1\n")
-			} else {
-				_, _ = io.WriteString(w, "ip=203.0.113.2\n")
+	for name, rejected := range map[string]string{
+		"wrong_length":      strings.Repeat("L", 312),
+		"invalid_timestamp": strings.Repeat("Q", 292),
+		"expired":           otsTestToken(time.Now().Add(-2*time.Hour), 'E'),
+	} {
+		t.Run(name, func(t *testing.T) {
+			issuedAt := time.Now().UTC().Add(-20 * time.Minute).Truncate(time.Second)
+			validToken := otsTestToken(issuedAt, 'Q')
+			var mu sync.Mutex
+			var bodies [][]byte
+			var seenStates []string
+			closed := make(chan struct{}, 3)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == "/cdn-cgi/trace" {
+					if strings.Contains(r.Header.Get("X-Test-Proxy"), "node1") {
+						_, _ = io.WriteString(w, "ip=203.0.113.1\n")
+					} else {
+						_, _ = io.WriteString(w, "ip=203.0.113.2\n")
+					}
+					return
+				}
+				body, _ := io.ReadAll(r.Body)
+				mu.Lock()
+				bodies = append(bodies, body)
+				seenStates = append(seenStates, r.Header.Get(openAICodexTurnStateHeader))
+				mu.Unlock()
+				value := rejected
+				if strings.Contains(r.Header.Get("X-Test-Proxy"), "node2") {
+					value = validToken
+				}
+				w.Header().Set("Content-Type", "text/event-stream")
+				w.Header().Set(openAICodexTurnStateHeader, value)
+				w.WriteHeader(200)
+				w.(http.Flusher).Flush()
+				<-r.Context().Done()
+				closed <- struct{}{}
+			}))
+			defer server.Close()
+			u, _ := url.Parse(server.URL)
+			a := otsAccount(1)
+			store := &otsTestStore{}
+			repo := &otsTestAccounts{account: a}
+			gateway := &OpenAIGatewayService{accountRepo: repo, httpUpstream: &otsLocalUpstream{server.Client(), u}, openAITokenProvider: NewOpenAITokenProvider(repo, nil, nil)}
+			proxies := &otsTestProxies{nodes: map[int64]*Proxy{1: {ID: 1, Protocol: "http", Host: "node1", Port: 8080, Status: StatusActive}, 2: {ID: 2, Protocol: "http", Host: "node2", Port: 8080, Status: StatusActive}, 3: {ID: 3, Protocol: "http", Host: "node3", Port: 8080, Status: StatusActive}}}
+			svc := NewOpenAITurnStateService(store, repo, proxies, gateway)
+			defer svc.Stop()
+			gateway.turnStates = svc
+			cfg, err := ParseOpenAITurnStateConfig(a.Extra)
+			require.NoError(t, err)
+			key := OpenAITurnStateKey{1, "model-a", "omitted"}
+			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+			defer cancel()
+			r, m := svc.probeTarget(ctx, a, cfg, key, &OpenAITurnStateLease{Key: key})
+			require.NotNil(t, r)
+			require.Equal(t, validToken, r.State)
+			require.Equal(t, issuedAt, r.IssuedAt)
+			require.Equal(t, issuedAt.Add(time.Hour), r.ExpiresAt)
+			require.Equal(t, r.ExpiresAt.Add(-10*time.Minute), r.RefreshAt)
+			require.Equal(t, 2, m.Attempts)
+			require.Equal(t, int64(2), r.SourceProxyID)
+			for i := 0; i < 2; i++ {
+				select {
+				case <-closed:
+				case <-ctx.Done():
+					t.Fatal("probe waited for the SSE body instead of closing the stream")
+				}
 			}
-			return
-		}
-		body, _ := io.ReadAll(r.Body)
-		mu.Lock()
-		bodies = append(bodies, body)
-		seenStates = append(seenStates, r.Header.Get(openAICodexTurnStateHeader))
-		mu.Unlock()
-		value := strings.Repeat("L", 312)
-		if strings.Contains(r.Header.Get("X-Test-Proxy"), "node2") {
-			value = strings.Repeat("Q", 292)
-		}
-		w.Header().Set("Content-Type", "text/event-stream")
-		w.Header().Set(openAICodexTurnStateHeader, value)
-		w.WriteHeader(200)
-		w.(http.Flusher).Flush()
-		<-r.Context().Done()
-		closed <- struct{}{}
-	}))
-	defer server.Close()
-	u, _ := url.Parse(server.URL)
-	a := otsAccount(1)
-	store := &otsTestStore{}
-	repo := &otsTestAccounts{account: a}
-	gateway := &OpenAIGatewayService{accountRepo: repo, httpUpstream: &otsLocalUpstream{server.Client(), u}, openAITokenProvider: NewOpenAITokenProvider(repo, nil, nil)}
-	proxies := &otsTestProxies{nodes: map[int64]*Proxy{1: {ID: 1, Protocol: "http", Host: "node1", Port: 8080, Status: StatusActive}, 2: {ID: 2, Protocol: "http", Host: "node2", Port: 8080, Status: StatusActive}, 3: {ID: 3, Protocol: "http", Host: "node3", Port: 8080, Status: StatusActive}}}
-	svc := NewOpenAITurnStateService(store, repo, proxies, gateway)
-	defer svc.Stop()
-	gateway.turnStates = svc
-	cfg, err := ParseOpenAITurnStateConfig(a.Extra)
-	require.NoError(t, err)
-	key := OpenAITurnStateKey{1, "model-a", "omitted"}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
-	defer cancel()
-	r, m := svc.probeTarget(ctx, a, cfg, key, &OpenAITurnStateLease{Key: key})
-	require.NotNil(t, r)
-	require.Equal(t, strings.Repeat("Q", 292), r.State)
-	require.Equal(t, 2, m.Attempts)
-	require.Equal(t, int64(2), r.SourceProxyID)
-	for i := 0; i < 2; i++ {
-		select {
-		case <-closed:
-		case <-ctx.Done():
-			t.Fatal("probe waited for the SSE body instead of closing the stream")
-		}
+			mu.Lock()
+			defer mu.Unlock()
+			require.Len(t, bodies, 2)
+			require.Equal(t, []string{"", ""}, seenStates)
+			for _, body := range bodies {
+				require.NotContains(t, string(body), "previous_response_id")
+				require.NotContains(t, string(body), "client-history")
+				var payload map[string]any
+				require.NoError(t, json.Unmarshal(body, &payload))
+				require.Equal(t, "model-a", payload["model"])
+				require.Equal(t, true, payload["stream"])
+			}
+			require.Nil(t, a.ProxyID, "probing must not edit the business proxy")
+		})
 	}
-	mu.Lock()
-	defer mu.Unlock()
-	require.Len(t, bodies, 2)
-	require.Equal(t, []string{"", ""}, seenStates)
-	for _, body := range bodies {
-		require.NotContains(t, string(body), "previous_response_id")
-		require.NotContains(t, string(body), "client-history")
-		var payload map[string]any
-		require.NoError(t, json.Unmarshal(body, &payload))
-		require.Equal(t, "model-a", payload["model"])
-		require.Equal(t, true, payload["stream"])
-	}
-	require.Nil(t, a.ProxyID, "probing must not edit the business proxy")
 }
 
 func TestOpenAITurnStateWSPoolUsesHardStateAndModelCompatibility(t *testing.T) {
@@ -280,7 +293,7 @@ func TestOpenAITurnStateWSRejectsOnlyIncompatibleFrame(t *testing.T) {
 func TestOpenAITurnStateBusinessResponseDoesNotReplaceOrExtendCache(t *testing.T) {
 	a := otsAccount(1)
 	key := OpenAITurnStateKey{1, "model-a", "omitted"}
-	value := strings.Repeat("c", 292)
+	value := otsTestToken(time.Now(), 'c')
 	returned := strings.Repeat("r", 312)
 	expires := time.Now().Add(time.Minute)
 	store := &otsTestStore{records: map[OpenAITurnStateKey]*OpenAITurnStateRecord{key: {State: value, StateLength: 292, StateDigest: turnStateDigest(value), ExpiresAt: expires}}}
@@ -317,7 +330,7 @@ func TestOpenAITurnStateBusinessResponseDoesNotReplaceOrExtendCache(t *testing.T
 func TestOpenAITurnStateWSPoolInjectsCurrentValueAtDial(t *testing.T) {
 	a := otsAccount(1)
 	key := OpenAITurnStateKey{1, "model-a", "omitted"}
-	value := strings.Repeat("n", 292)
+	value := otsTestToken(time.Now(), 'n')
 	store := &otsTestStore{records: map[OpenAITurnStateKey]*OpenAITurnStateRecord{key: {State: value, StateLength: 292, StateDigest: turnStateDigest(value), Generation: "new", ExpiresAt: time.Now().Add(time.Hour)}}}
 	svc := NewOpenAITurnStateService(store, &otsTestAccounts{account: a}, nil, nil)
 	defer svc.Stop()

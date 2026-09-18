@@ -46,6 +46,7 @@ export interface OpenAITurnStateStatus {
   state_length?: number
   state_digest?: string
   probed_at?: string
+  issued_at?: string
   expires_at?: string
   probe: {
     task_id: string

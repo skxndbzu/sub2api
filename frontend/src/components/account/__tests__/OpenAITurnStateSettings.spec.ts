@@ -53,6 +53,7 @@ describe('OpenAI turn-state controls', () => {
     vi.mocked(getTurnStateStatus).mockResolvedValue([{
       account_id: 42, model: 'actual-model', service_tier: 'priority', status: 'available', enabled: true,
       remaining_seconds: 3500, source_proxy_id: 1, state_length: 292, state_digest: 'diagnostic-only',
+      issued_at: '2026-09-18T10:00:00Z', expires_at: '2026-09-18T11:00:00Z',
       probe: { task_id: 'task1', probe_status: 'succeeded', result: 'matched', attempts: 2, distinct_exits: 2, next_attempt_at: '' }
     }])
     const wrapper = mountSettings({ accountId: 42 })
@@ -60,6 +61,9 @@ describe('OpenAI turn-state controls', () => {
     expect(wrapper.text()).toContain('actual-model')
     expect(wrapper.text()).toContain('priority')
     expect(wrapper.text()).toContain('3500s')
+    expect(wrapper.text()).toContain('admin.accounts.turnState.issuedAt')
+    expect(wrapper.text()).toContain('admin.accounts.turnState.expiresAt')
+    expect(wrapper.text()).toContain('admin.accounts.turnState.expiryHint')
     const actions = wrapper.findAll('button')
     await actions[0].trigger('click')
     await flushPromises()
@@ -79,5 +83,14 @@ describe('OpenAI turn-state controls', () => {
     await flushPromises()
     expect(wrapper.get('[role="alert"]').text()).toContain('statusUnavailable')
     expect(wrapper.find('tbody').exists()).toBe(false)
+  })
+
+  it('preserves the editable early refresh threshold', async () => {
+    const wrapper = mountSettings()
+    const label = wrapper.findAll('label').find(item => item.text().includes('admin.accounts.turnState.refreshBefore'))!
+    await label.get('input[type="number"]').setValue(300)
+    expect(wrapper.emitted('update:modelValue')?.at(-1)?.[0]).toMatchObject({
+      refresh_before_seconds: 300, cache_ttl_seconds: 3600
+    })
   })
 })

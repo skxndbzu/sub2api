@@ -3,7 +3,6 @@ package service
 import (
 	"context"
 	"net/http"
-	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -23,7 +22,7 @@ func (s *turnStatePoolTestStore) Read(context.Context, OpenAITurnStateKey, strin
 }
 
 func (s *turnStatePoolTestStore) set(generation string) {
-	value := strings.Repeat(generation, 292)
+	value := otsTestToken(time.Now(), generation[0])
 	s.current.Store(&OpenAITurnStateRecord{
 		State: value, StateLength: len(value), StateDigest: turnStateDigest(value),
 		Generation: generation, ExpiresAt: time.Now().Add(time.Hour),

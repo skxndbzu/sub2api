@@ -64,7 +64,13 @@ func (s *OpenAITurnStateService) probeTarget(ctx context.Context, a *Account, cf
 		} else if len(state) != cfg.TargetLength {
 			result.Result = "state_length_mismatch"
 		} else {
-			r := &OpenAITurnStateRecord{OpenAITurnStateKey: key, State: state, ProbedAt: sampled, ExpiresAt: sampled.Add(time.Duration(cfg.CacheTTLSeconds) * time.Second), RefreshAt: sampled.Add(time.Duration(cfg.CacheTTLSeconds-cfg.RefreshBeforeSeconds) * time.Second), SourceProxyID: id, EgressDigest: turnStateDigest(ip.String()), StateLength: len(state), StateDigest: turnStateDigest(state), IdentityVersion: lease.Control.IdentityVersion, ConfigVersion: lease.Control.ConfigVersion, AccountEpoch: lease.Control.Epoch, TargetEpoch: lease.TargetEpoch, Generation: uuid.NewString()}
+			issuedAt, expiresAt, refreshAt, lifetimeErr := openAITurnStateLifetime(state, cfg, sampled)
+			if lifetimeErr != nil {
+				result.Result = lifetimeErr.Error()
+				slog.Debug("openai_turn_state_probe_candidate", "account_id", a.ID, "model", key.Model, "service_tier", key.ServiceTier, "proxy_id", id, "state_length", len(state), "result", result.Result)
+				continue
+			}
+			r := &OpenAITurnStateRecord{OpenAITurnStateKey: key, State: state, IssuedAt: issuedAt, ProbedAt: sampled, ExpiresAt: expiresAt, RefreshAt: refreshAt, SourceProxyID: id, EgressDigest: turnStateDigest(ip.String()), StateLength: len(state), StateDigest: turnStateDigest(state), IdentityVersion: lease.Control.IdentityVersion, ConfigVersion: lease.Control.ConfigVersion, AccountEpoch: lease.Control.Epoch, TargetEpoch: lease.TargetEpoch, Generation: uuid.NewString()}
 			slog.Info("openai_turn_state_probe_match", "account_id", a.ID, "model", key.Model, "service_tier", key.ServiceTier, "proxy_id", id, "state_length", len(state), "state_digest", r.StateDigest[:16], "usage", "unknown")
 			return r, result
 		}

@@ -54,6 +54,7 @@
         <input type="number" class="input w-full" :min="field.min" :max="field.max" step="1" :value="modelValue[field.key]" :disabled="bulk && !selected.has(field.key)" @input="setField(field.key, Number(inputValue($event)))" />
       </label>
     </div>
+    <p class="text-xs text-gray-500">{{ t('admin.accounts.turnState.expiryHint') }}</p>
     <div class="flex items-center gap-3">
       <input v-if="bulk" type="checkbox" :checked="selected.has('log_response_values')" :aria-label="t('admin.accounts.turnState.changeLog')" @change="toggleField('log_response_values')" />
       <label class="flex items-center gap-2 text-sm">
@@ -80,6 +81,7 @@
               <td class="p-2">{{ t(`admin.accounts.turnState.states.${row.status}`) }}<br /><span v-if="!row.enabled">{{ t('admin.accounts.turnState.disabled') }}</span><span v-else-if="row.status === 'available' && ['queued', 'running'].includes(row.probe.probe_status)">{{ t('admin.accounts.turnState.refreshing') }}</span></td>
               <td class="space-y-1 p-2">
                 <div v-if="row.state_length">{{ row.state_length }} {{ t('admin.accounts.turnState.characters') }} · {{ row.remaining_seconds }}s · #{{ row.source_proxy_id }}</div>
+                <div v-if="row.issued_at">{{ t('admin.accounts.turnState.issuedAt') }} {{ formatTime(row.issued_at) }}</div>
                 <div v-if="row.probed_at">{{ t('admin.accounts.turnState.probedAt') }} {{ formatTime(row.probed_at) }}</div>
                 <div v-if="row.expires_at">{{ t('admin.accounts.turnState.expiresAt') }} {{ formatTime(row.expires_at) }}</div>
                 <div v-if="row.probe.result">{{ row.probe.result }} · {{ row.probe.attempts || 0 }}/{{ modelValue.max_attempts }}</div>

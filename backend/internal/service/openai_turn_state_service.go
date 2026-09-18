@@ -352,6 +352,22 @@ func (s *OpenAITurnStateService) Resolve(ctx context.Context, a *Account, model,
 	if r.StateLength != cfg.TargetLength || len(r.State) != cfg.TargetLength || !validOpenAITurnState(r.State) {
 		return d
 	}
+	now := time.Now()
+	_, expiresAt, _, expiryErr := openAITurnStateLifetime(r.State, cfg, now)
+	if expiryErr != nil {
+		s.enqueue(d.Key)
+		return d
+	}
+	if !r.ExpiresAt.IsZero() && r.ExpiresAt.Before(expiresAt) {
+		expiresAt = r.ExpiresAt
+	}
+	if remaining := expiresAt.Sub(now); remaining < ttl {
+		ttl = remaining
+	}
+	if ttl <= 0 {
+		s.enqueue(d.Key)
+		return d
+	}
 	deleteOpenAIHeaderEqualFold(h, openAICodexTurnStateHeader)
 	h.Set(openAICodexTurnStateHeader, r.State)
 	d.Source = "probe_cache"
@@ -359,7 +375,7 @@ func (s *OpenAITurnStateService) Resolve(ctx context.Context, a *Account, model,
 	d.StateDigest = r.StateDigest
 	d.AccountEpoch = r.AccountEpoch
 	d.TargetEpoch = r.TargetEpoch
-	d.ExpiresAt = time.Now().Add(ttl)
+	d.ExpiresAt = now.Add(ttl)
 	if ttl <= time.Duration(cfg.RefreshBeforeSeconds)*time.Second {
 		s.enqueue(d.Key)
 	}
@@ -478,6 +494,7 @@ func (s *OpenAITurnStateService) Status(ctx context.Context, id int64) ([]OpenAI
 		if r != nil {
 			status.Status = "available"
 			status.ProbedAt = &r.ProbedAt
+			status.IssuedAt = &r.IssuedAt
 			status.ExpiresAt = &r.ExpiresAt
 			status.RemainingSeconds = int64(ttl.Seconds())
 			status.SourceProxyID = r.SourceProxyID

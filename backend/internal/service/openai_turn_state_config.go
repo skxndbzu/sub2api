@@ -212,7 +212,8 @@ func openAITurnStateIdentity(account *Account, source *Account) string {
 
 func openAITurnStateConfigVersion(cfg OpenAITurnStateConfig) string {
 	cfg.LogResponseValues = false
-	data, _ := json.Marshal(cfg)
+	// Invalidate caches created with probe-time rather than token-time expiry.
+	data, _ := json.Marshal([]any{"fernet-issued-at-v1", cfg})
 	return turnStateDigest(string(data))
 }
 
