@@ -48,28 +48,43 @@ type openAIWSPolicyEnforcingFrameConn struct {
 
 var _ openaiwsv2.FrameConn = (*openAIWSPolicyEnforcingFrameConn)(nil)
 
+var errOpenAITurnStateWSRoute = errors.New("managed turn-state WebSocket route changed")
+
+var openAITurnStateWSRouteEvent = []byte(`{"type":"error","error":{"type":"invalid_request_error","code":"turn_state_route_changed","message":"Open a new WebSocket connection to change the model or service tier."}}`)
+
 func (c *openAIWSPolicyEnforcingFrameConn) ReadFrame(ctx context.Context) (coderws.MessageType, []byte, error) {
 	if c == nil || c.inner == nil {
 		return coderws.MessageText, nil, errOpenAIWSConnClosed
 	}
-	msgType, payload, err := c.inner.ReadFrame(ctx)
-	if err != nil {
-		return msgType, payload, err
-	}
-	if c.filter == nil {
-		return msgType, payload, nil
-	}
-	updated, blocked, filterErr := c.filter(msgType, payload)
-	if filterErr != nil {
-		return msgType, payload, filterErr
-	}
-	if blocked != nil {
-		if c.onBlock != nil {
-			c.onBlock(blocked)
+	for {
+		msgType, payload, err := c.inner.ReadFrame(ctx)
+		if err != nil {
+			return msgType, payload, err
 		}
-		return msgType, nil, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, blocked.Message, blocked)
+		if c.filter == nil {
+			return msgType, payload, nil
+		}
+		updated, blocked, filterErr := c.filter(msgType, payload)
+		if errors.Is(filterErr, errOpenAITurnStateWSRoute) {
+			writeCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+			err := c.inner.WriteFrame(writeCtx, coderws.MessageText, openAITurnStateWSRouteEvent)
+			cancel()
+			if err != nil {
+				return msgType, nil, err
+			}
+			continue
+		}
+		if filterErr != nil {
+			return msgType, payload, filterErr
+		}
+		if blocked != nil {
+			if c.onBlock != nil {
+				c.onBlock(blocked)
+			}
+			return msgType, nil, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, blocked.Message, blocked)
+		}
+		return msgType, updated, nil
 	}
-	return msgType, updated, nil
 }
 
 func (c *openAIWSPolicyEnforcingFrameConn) WriteFrame(ctx context.Context, msgType coderws.MessageType, payload []byte) error {
@@ -840,7 +855,7 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 		turnState = strings.TrimSpace(c.GetHeader(openAIWSTurnStateHeader))
 		turnMetadata = strings.TrimSpace(c.GetHeader(openAIWSTurnMetadataHeader))
 	}
-	headers, _, buildHdrErr := s.buildOpenAIWSHeaders(
+	headers, sessionResolution, buildHdrErr := s.buildOpenAIWSHeaders(
 		ctx,
 		c,
 		account,
@@ -876,7 +891,14 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			return fmt.Errorf("refresh ws authentication headers: %w", err)
 		}
 		dialCtx, cancelDial := context.WithTimeout(ctx, s.openAIWSDialTimeout())
+		if s.turnStates != nil && sessionResolution.TurnState.Managed {
+			sessionResolution.TurnState = s.turnStates.RefreshDecision(dialCtx, account, headers, sessionResolution.TurnState)
+		}
 		upstreamConn, statusCode, handshakeHeaders, err = dialer.Dial(dialCtx, wsURL, headers, proxyURL)
+		logOpenAITurnStateResponse(ctx, account, handshakeHeaders, "ws_passthrough_handshake")
+		if err == nil && s.turnStates != nil {
+			s.turnStates.NoteOrigin(ctx, account, handshakeHeaders.Get(openAICodexTurnStateHeader))
+		}
 		cancelDial()
 		if err == nil {
 			break
@@ -1076,6 +1098,13 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 			// → 不带 model 的 response.create fallback 到 gpt-4o" 的
 			// 绕过路径。这里只看 session.update 事件中的 session.model
 			// 字段，response.create 自己的 model 仍然由其本帧字段决定。
+			if sessionResolution.TurnState.Managed && gjson.GetBytes(payload, "type").String() == "session.update" {
+				updatedModel := gjson.GetBytes(payload, "session.model")
+				updatedTier := gjson.GetBytes(payload, "session.service_tier")
+				if (updatedModel.Exists() && updatedModel.String() != sessionResolution.TurnState.Key.Model) || (updatedTier.Exists() && turnStateTier(updatedTier.String()) != sessionResolution.TurnState.Key.ServiceTier) {
+					return payload, nil, errOpenAITurnStateWSRoute
+				}
+			}
 			if updated := openAIWSPassthroughPolicyModelFromSessionFrame(account, payload); updated != "" {
 				capturedSessionModel = updated
 			}
@@ -1096,6 +1125,11 @@ func (s *OpenAIGatewayService) proxyResponsesWebSocketV2Passthrough(
 				payload = s.ReplaceModelInBody(payload, model)
 			}
 			out, blocked, policyErr := s.applyOpenAIFastPolicyToWSResponseCreate(ctx, account, model, payload)
+			if policyErr == nil && blocked == nil && isResponseCreate && sessionResolution.TurnState.Managed {
+				if model != sessionResolution.TurnState.Key.Model || turnStateTier(gjson.GetBytes(out, "service_tier").String()) != sessionResolution.TurnState.Key.ServiceTier {
+					return payload, nil, errOpenAITurnStateWSRoute
+				}
+			}
 			// 多轮 passthrough usage：仅在成功（non-block / non-err）
 			// 的 response.create 帧上更新 usageMeta，使用
 			// filter 处理后的 payload，与首帧 policy-after-extract 语义

@@ -3299,6 +3299,11 @@
       </div>
 
       <!-- Codex 指纹收敛模式（仅 OpenAI OAuth） -->
+      <OpenAITurnStateSettings
+        v-if="form.platform === 'openai' && form.type === 'oauth'"
+        v-model="turnStateConfig"
+        :proxies="proxies"
+      />
       <div
         v-if="form.platform === 'openai' && accountCategory === 'oauth-based'"
         class="border-t border-gray-200 pt-4 dark:border-dark-600"
@@ -3933,6 +3938,8 @@ import ProxySelector from '@/components/common/ProxySelector.vue'
 import ProxyAdBanner from '@/components/common/ProxyAdBanner.vue'
 import GroupSelector from '@/components/common/GroupSelector.vue'
 import ModelWhitelistSelector from '@/components/account/ModelWhitelistSelector.vue'
+import OpenAITurnStateSettings from '@/components/account/OpenAITurnStateSettings.vue'
+import { defaultOpenAITurnStateConfig } from '@/utils/openaiTurnState'
 import QuotaLimitCard from '@/components/account/QuotaLimitCard.vue'
 import Toggle from '@/components/common/Toggle.vue'
 import GrokBaseUrlPresets from '@/components/account/GrokBaseUrlPresets.vue'
@@ -4147,6 +4154,7 @@ interface TempUnschedRuleForm {
 // State
 const step = ref(1)
 const submitting = ref(false)
+const turnStateConfig = ref(defaultOpenAITurnStateConfig())
 const accountCategory = ref<'oauth-based' | 'apikey' | 'bedrock' | 'service_account'>('oauth-based') // UI selection for account category
 const addMethod = ref<AddMethod>('oauth') // For oauth-based: 'oauth' or 'setup-token'
 const apiKeyBaseUrl = ref('https://api.anthropic.com')
@@ -5292,6 +5300,7 @@ const submitCreateAccount = async (payload: CreateAccountRequest) => {
 
 // Methods
 const resetForm = () => {
+  turnStateConfig.value = defaultOpenAITurnStateConfig()
   step.value = 1
   form.name = ''
   form.notes = ''
@@ -5420,6 +5429,7 @@ const buildOpenAIExtra = (base?: Record<string, unknown>): Record<string, unknow
   }
 
   const extra: Record<string, unknown> = { ...(base || {}) }
+  if (form.type === 'oauth') extra.openai_turn_state = turnStateConfig.value
   if (accountCategory.value === 'oauth-based') {
     extra.openai_oauth_responses_websockets_v2_mode = openaiOAuthResponsesWebSocketV2Mode.value
     extra.openai_oauth_responses_websockets_v2_enabled = isOpenAIWSModeEnabled(openaiOAuthResponsesWebSocketV2Mode.value)

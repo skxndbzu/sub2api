@@ -184,6 +184,12 @@ func (s *OpenAIGatewayService) buildOpenAIWSHeaders(
 	// 覆盖所有 WS 模式（ctx_pool/dedicated/passthrough）的握手头。
 	account.ApplyHeaderOverrides(headers)
 	setOpenAICodexRoutingHint(headers, account, routingModel, routingServiceTier)
+	if s.turnStates != nil && account != nil {
+		if cfg, err := ParseOpenAITurnStateConfig(account.Extra); err == nil && cfg.Enabled {
+			s.guardOpenAICodexTurnStateEcho(c, account, headers)
+		}
+		sessionResolution.TurnState = s.turnStates.Resolve(ctx, account, routingModel, routingServiceTier, headers)
+	}
 	logOpenAIRoutingDiagnostics(
 		ctx,
 		account,

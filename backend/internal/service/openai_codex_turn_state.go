@@ -1,12 +1,14 @@
 package service
 
 import (
+	"context"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
 )
 
 // openAICodexTurnStateHeader 是 Codex 的回合状态头。上游在响应头中铸造该
@@ -14,6 +16,20 @@ import (
 // /responses SSE、/responses/compact JSON 与 WS 握手三种响应中捕获，见
 // codex-api/src/sse/responses.rs 与 endpoint/compact.rs）。
 const openAICodexTurnStateHeader = "x-codex-turn-state"
+
+type openAITurnStateOutboundContextKey struct{}
+
+func (s *OpenAIGatewayService) applyOpenAITurnStateFromBody(ctx context.Context, account *Account, req *http.Request, body []byte) *http.Request {
+	if s == nil || s.turnStates == nil || account == nil || ctx.Value(openAITurnStateProbeContextKey{}) != nil {
+		return req
+	}
+	fields := gjson.GetManyBytes(body, "model", "service_tier")
+	decision := s.turnStates.Resolve(ctx, account, fields[0].String(), fields[1].String(), req.Header)
+	if decision.Managed {
+		return req.WithContext(context.WithValue(req.Context(), openAITurnStateOutboundContextKey{}, decision))
+	}
+	return req
+}
 
 // turn-state blob 是上游在"出站身份"（含 #5553 指纹收敛改写后的
 // installation/session/thread 标识）下铸造的，同账号回放自洽；跨账号回放
@@ -56,7 +72,7 @@ func (s *OpenAIGatewayService) relayOpenAICodexTurnState(c *gin.Context, account
 		return
 	}
 	c.Writer.Header().Set(canonical, state)
-	s.noteOpenAICodexTurnStateProvenance(c, account)
+	s.noteOpenAICodexTurnStateProvenance(c, account, state)
 }
 
 // stageOpenAICodexTurnState 将上游 turn-state 暂存到延迟提交的响应头集合
@@ -89,7 +105,7 @@ func (s *OpenAIGatewayService) noteStagedOpenAICodexTurnStateCommitted(c *gin.Co
 	if staged == nil || strings.TrimSpace(staged.Get(openAICodexTurnStateHeader)) == "" {
 		return
 	}
-	s.noteOpenAICodexTurnStateProvenance(c, account)
+	s.noteOpenAICodexTurnStateProvenance(c, account, staged.Get(openAICodexTurnStateHeader))
 }
 
 func extractOpenAICodexTurnState(upstream http.Header) string {
@@ -100,9 +116,12 @@ func extractOpenAICodexTurnState(upstream http.Header) string {
 }
 
 // noteOpenAICodexTurnStateProvenance 记录（下游会话 → 铸造账号）。
-func (s *OpenAIGatewayService) noteOpenAICodexTurnStateProvenance(c *gin.Context, account *Account) {
+func (s *OpenAIGatewayService) noteOpenAICodexTurnStateProvenance(c *gin.Context, account *Account, states ...string) {
 	if s == nil || account == nil || account.ID <= 0 {
 		return
+	}
+	if s.turnStates != nil && c != nil && c.Request != nil && len(states) > 0 {
+		s.turnStates.NoteOrigin(c.Request.Context(), account, states[0])
 	}
 	seed := openAICodexTurnStateSeed(c)
 	if seed == "" {
@@ -116,12 +135,17 @@ func (s *OpenAIGatewayService) noteOpenAICodexTurnStateProvenance(c *gin.Context
 }
 
 // guardOpenAICodexTurnStateEcho 出站守卫：客户端回带的 turn-state 若已知由
-// 其他账号铸造则剥离，同账号或无溯源记录时保持原样。只剥离、不注入——
-// /responses 路径的客户端是真实 Codex，会按自身回合语义自行回带；服务端
-// 注入是 Claude 兼容桥（无法回带的客户端）的专属行为。
+// 其他账号铸造则剥离，同账号或无溯源记录时保持原样。本守卫只校验来源；
+// 账号启用共享状态后，由最终出站阶段另行覆盖注入匹配的缓存值。
 func (s *OpenAIGatewayService) guardOpenAICodexTurnStateEcho(c *gin.Context, account *Account, h http.Header) {
 	if s == nil || h == nil || account == nil {
 		return
+	}
+	if s.turnStates != nil {
+		cfg, err := ParseOpenAITurnStateConfig(account.Extra)
+		if err == nil && cfg.Enabled && c != nil && c.Request != nil && s.turnStates.GuardClient(c.Request.Context(), account, h) {
+			return
+		}
 	}
 	if strings.TrimSpace(h.Get(openAICodexTurnStateHeader)) == "" {
 		return

@@ -67,9 +67,10 @@ func (e *openAIWSDialError) Unwrap() error {
 }
 
 type openAIWSAcquireRequest struct {
-	Account *Account
-	WSURL   string
-	Headers http.Header
+	TurnState OpenAITurnStateDecision
+	Account   *Account
+	WSURL     string
+	Headers   http.Header
 	// HeadersFactory is evaluated inside dialConn. It exists so credentials
 	// whose authorization is per-dial (Agent Identity) are never cached in
 	// lastAcquire or delayed prewarm state.
@@ -83,6 +84,7 @@ type openAIWSAcquireRequest struct {
 }
 
 type openAIWSHandshakeCompatibilityKey struct {
+	turnState           string
 	betaFeatures        string
 	codexInstallationID string
 	sessionIDHyphen     string
@@ -820,7 +822,8 @@ type openAIWSPoolMetrics struct {
 }
 
 type openAIWSConnPool struct {
-	cfg *config.Config
+	turnStates *OpenAITurnStateService
+	cfg        *config.Config
 	// 通过接口解耦底层 WS 客户端实现，默认使用 coder/websocket。
 	clientDialer openAIWSClientDialer
 
@@ -1076,6 +1079,14 @@ func (p *openAIWSConnPool) Acquire(ctx context.Context, req openAIWSAcquireReque
 		p.metrics.acquireTotal.Add(1)
 	}
 	lease, err := p.acquire(ctx, cloneOpenAIWSAcquireRequest(req), 0)
+	if err == nil && lease != nil && p.turnStates != nil && req.TurnState.Managed {
+		headers := cloneHeader(req.Headers)
+		decision := p.turnStates.RefreshDecision(ctx, req.Account, headers, req.TurnState)
+		if lease.conn.handshakeCompatibility.turnState != decision.compatibility() {
+			lease.Release()
+			return nil, wrapOpenAIWSFallback("turn_state_changed_during_acquire", errors.New("upstream handshake no longer matches the requested turn state"))
+		}
+	}
 	if lease != nil && lease.conn != nil {
 		now := time.Now()
 		lease.idleBefore = lease.conn.idleDuration(now)
@@ -1093,8 +1104,12 @@ func (p *openAIWSConnPool) acquire(ctx context.Context, req openAIWSAcquireReque
 	}
 
 retryAcquire:
+	if p.turnStates != nil && req.TurnState.Managed {
+		req.TurnState = p.turnStates.RefreshDecision(ctx, req.Account, req.Headers, req.TurnState)
+	}
 	accountID := req.Account.ID
 	compatibility := normalizeOpenAIWSHandshakeCompatibility(req.Account, req.Headers)
+	compatibility.turnState = req.TurnState.compatibility()
 	routingAffinity := normalizeOpenAIWSRoutingAffinity(req.Headers)
 	effectiveMaxConns := p.effectiveMaxConnsByAccount(req.Account)
 	if effectiveMaxConns <= 0 {
@@ -2061,7 +2076,14 @@ func (p *openAIWSConnPool) dialConn(ctx context.Context, req openAIWSAcquireRequ
 			return nil, err
 		}
 	}
+	if p.turnStates != nil && req.TurnState.Managed {
+		req.TurnState = p.turnStates.RefreshDecision(ctx, req.Account, headers, req.TurnState)
+	}
 	conn, status, handshakeHeaders, err := p.clientDialer.Dial(ctx, req.WSURL, headers, req.ProxyURL)
+	logOpenAITurnStateResponse(ctx, req.Account, handshakeHeaders, "ws_pool_handshake")
+	if err == nil && p.turnStates != nil {
+		p.turnStates.NoteOrigin(ctx, req.Account, handshakeHeaders.Get(openAICodexTurnStateHeader))
+	}
 	if err != nil {
 		var handshakeErr *openAIWSHandshakeError
 		var responseBody []byte
@@ -2087,8 +2109,9 @@ func (p *openAIWSConnPool) dialConn(ctx context.Context, req openAIWSAcquireRequ
 	accountID := req.Account.ID
 	evict := func() { p.evictConn(accountID, id) }
 	pooledConn.onPeerClosed.Store(&evict)
-	pooledConn.handshakeCompatibility = normalizeOpenAIWSHandshakeCompatibility(req.Account, req.Headers)
-	pooledConn.routingAffinity = normalizeOpenAIWSRoutingAffinity(req.Headers)
+	pooledConn.handshakeCompatibility = normalizeOpenAIWSHandshakeCompatibility(req.Account, headers)
+	pooledConn.handshakeCompatibility.turnState = req.TurnState.compatibility()
+	pooledConn.routingAffinity = normalizeOpenAIWSRoutingAffinity(headers)
 	return pooledConn, nil
 }
 
@@ -2273,6 +2296,7 @@ func cloneOpenAIWSAcquireRequestPtr(req *openAIWSAcquireRequest) *openAIWSAcquir
 
 func sameOpenAIWSPrewarmTarget(a, b openAIWSAcquireRequest) bool {
 	return stringsTrim(a.WSURL) == stringsTrim(b.WSURL) &&
+		a.TurnState.compatibility() == b.TurnState.compatibility() &&
 		stringsTrim(a.ProxyURL) == stringsTrim(b.ProxyURL) &&
 		normalizeOpenAIWSHandshakeCompatibility(a.Account, a.Headers) == normalizeOpenAIWSHandshakeCompatibility(b.Account, b.Headers)
 }

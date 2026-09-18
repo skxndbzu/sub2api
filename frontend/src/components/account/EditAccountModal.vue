@@ -2252,6 +2252,13 @@
       </div>
 
       <!-- Codex 指纹收敛模式（仅 OpenAI OAuth） -->
+      <OpenAITurnStateSettings
+        v-if="show && account?.platform === 'openai' && account?.type === 'oauth'"
+        :key="account.id"
+        v-model="turnStateConfig"
+        :proxies="proxies"
+        :account-id="account.id"
+      />
       <div
         v-if="account?.platform === 'openai' && account?.type === 'oauth'"
         class="border-t border-gray-200 pt-4 dark:border-dark-600"
@@ -3049,6 +3056,8 @@ import ProxySelector from '@/components/common/ProxySelector.vue'
 import ProxyAdBanner from '@/components/common/ProxyAdBanner.vue'
 import GroupSelector from '@/components/common/GroupSelector.vue'
 import ModelWhitelistSelector from '@/components/account/ModelWhitelistSelector.vue'
+import OpenAITurnStateSettings from '@/components/account/OpenAITurnStateSettings.vue'
+import { defaultOpenAITurnStateConfig, readOpenAITurnStateConfig } from '@/utils/openaiTurnState'
 import QuotaLimitCard from '@/components/account/QuotaLimitCard.vue'
 import GrokBaseUrlPresets from '@/components/account/GrokBaseUrlPresets.vue'
 import CnBaseUrlPresets from '@/components/account/CnBaseUrlPresets.vue'
@@ -3180,6 +3189,7 @@ interface TempUnschedRuleForm {
 
 // State
 const submitting = ref(false)
+const turnStateConfig = ref(defaultOpenAITurnStateConfig())
 const editBaseUrl = ref('https://api.anthropic.com')
 const editApiKey = ref('')
 
@@ -4064,6 +4074,7 @@ const syncFormFromAccount = (newAccount: Account | null) => {
     }
     if (newAccount.type === 'oauth') {
       const fpMode = extra?.codex_fingerprint_mode as string | undefined
+      turnStateConfig.value = readOpenAITurnStateConfig(extra)
       // 缺省/非法值按 off 呈现，与后端 GetCodexFingerprintMode 的 opt-in 语义一致（#5610）
       codexFingerprintMode.value = (['off', 'device', 'session', 'full'].includes(fpMode || '')
         ? fpMode as CodexFingerprintMode
@@ -5599,6 +5610,7 @@ const handleSubmit = async () => {
       // 指纹收敛模式：默认 off（不写入）；device/session/full 是显式 opt-in，
       // 必须落键，否则管理员的选择会被后端当作"未设置"而回落到 off（#5610）。
       if (props.account.type === 'oauth') {
+        newExtra.openai_turn_state = turnStateConfig.value
         if (codexFingerprintMode.value !== 'off') {
           newExtra.codex_fingerprint_mode = codexFingerprintMode.value
         } else {

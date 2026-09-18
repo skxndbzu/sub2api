@@ -974,6 +974,14 @@
       </div>
 
       <!-- Codex 指纹收敛模式（仅 OpenAI OAuth） -->
+      <OpenAITurnStateSettings
+        v-if="allOpenAIOAuth"
+        :key="String(show)"
+        v-model="turnStateConfig"
+        :proxies="proxies"
+        bulk
+        @patch="turnStatePatch = $event"
+      />
       <div v-if="allOpenAIOAuth" class="border-t border-gray-200 pt-4 dark:border-dark-600">
         <div class="mb-3 flex items-center justify-between">
           <label class="input-label mb-0">{{ t('admin.accounts.openai.codexFingerprintMode') }}</label>
@@ -1492,6 +1500,8 @@ import Select from '@/components/common/Select.vue'
 import ProxySelector from '@/components/common/ProxySelector.vue'
 import GroupSelector from '@/components/common/GroupSelector.vue'
 import ModelWhitelistSelector from '@/components/account/ModelWhitelistSelector.vue'
+import OpenAITurnStateSettings from '@/components/account/OpenAITurnStateSettings.vue'
+import { defaultOpenAITurnStateConfig, type OpenAITurnStateConfig } from '@/utils/openaiTurnState'
 import Icon from '@/components/icons/Icon.vue'
 import {
   buildModelMappingObject as buildModelMappingPayload,
@@ -1673,6 +1683,8 @@ const enableRpmLimit = ref(false)
 
 // State - field values
 const submitting = ref(false)
+const turnStateConfig = ref(defaultOpenAITurnStateConfig())
+const turnStatePatch = ref<Partial<OpenAITurnStateConfig>>({})
 const showMixedChannelWarning = ref(false)
 const mixedChannelWarningMessage = ref('')
 const pendingUpdatesForConfirm = ref<Record<string, unknown> | null>(null)
@@ -1937,8 +1949,13 @@ const buildUpdatePayload = (): Record<string, unknown> | null => {
   }
 
   if (enableProxy.value) {
+    // Other account settings continue to use their existing bulk semantics.
     // 后端期望 proxy_id: 0 表示清除代理，而不是 null
     updates.proxy_id = proxyId.value === null ? 0 : proxyId.value
+  }
+
+  if (allOpenAIOAuth.value && Object.keys(turnStatePatch.value).length > 0) {
+    ensureExtra().openai_turn_state = turnStatePatch.value
   }
 
   if (enableConcurrency.value) {
@@ -2223,6 +2240,7 @@ const handleSubmit = async () => {
     enableCodexCLIOnly.value ||
     enableCodexCLIOnlyAppServer.value ||
     enableCodexFingerprintMode.value ||
+    Object.keys(turnStatePatch.value).length > 0 ||
     enableOpenAICompactMode.value ||
     enableOpenAICompactModelMapping.value ||
     enableRpmLimit.value ||
@@ -2375,6 +2393,8 @@ watch(
       enableCodexCLIOnlyAppServer.value = false
       enableCodexFingerprintMode.value = false
       codexFingerprintMode.value = 'off'
+      turnStateConfig.value = defaultOpenAITurnStateConfig()
+      turnStatePatch.value = {}
       enableOpenAICompactMode.value = false
       enableOpenAICompactModelMapping.value = false
       enableRpmLimit.value = false

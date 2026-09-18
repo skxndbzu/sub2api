@@ -53,6 +53,7 @@ func hasOpenAIWSHeader(headers http.Header, key string) bool {
 }
 
 type openAIWSSessionHeaderResolution struct {
+	TurnState          OpenAITurnStateDecision
 	SessionID          string
 	ConversationID     string
 	SessionSource      string

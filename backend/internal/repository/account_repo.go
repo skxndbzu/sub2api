@@ -42,8 +42,9 @@ import (
 //   - sql: 原生 SQL 执行器，用于复杂查询和批量操作
 //   - schedulerCache: 调度器缓存，用于在账号状态变更时同步快照
 type accountRepository struct {
-	client *dbent.Client // Ent ORM 客户端
-	sql    sqlExecutor   // 原生 SQL 执行接口
+	turnStateLifecycle service.AccountTurnStateLifecycle
+	client             *dbent.Client // Ent ORM 客户端
+	sql                sqlExecutor   // 原生 SQL 执行接口
 	// schedulerCache 用于在账号状态变更时主动同步快照到缓存，
 	// 确保粘性会话能及时感知账号不可用状态。
 	// Used to proactively sync account snapshot to cache when status changes,
@@ -135,6 +136,9 @@ func (r *accountRepository) Create(ctx context.Context, account *service.Account
 func createAccountRecord(ctx context.Context, client *dbent.Client, account *service.Account) error {
 	if account == nil {
 		return service.ErrAccountNilInput
+	}
+	if err := service.ValidateOpenAITurnStateConfig(account); err != nil {
+		return err
 	}
 
 	builder := client.Account.Create().
@@ -463,6 +467,28 @@ func (r *accountRepository) updateAccount(
 	if account == nil {
 		return nil
 	}
+	if r.turnStateLifecycle == nil || account.Platform != service.PlatformOpenAI {
+		if err := service.ValidateOpenAITurnStateConfig(account); err != nil {
+			return err
+		}
+	}
+	if r.turnStateLifecycle != nil && account.Platform == service.PlatformOpenAI {
+		current, err := r.GetByID(ctx, account.ID)
+		if err != nil {
+			return err
+		}
+		account.Extra = service.MergeOpenAITurnStateExtra(current.Extra, account.Extra)
+		if err := service.ValidateOpenAITurnStateConfig(account); err != nil {
+			return err
+		}
+		if service.OpenAITurnStateAccountChanged(current, account) {
+			finish, err := r.beginTurnStateWrite(ctx, []int64{account.ID})
+			if err != nil {
+				return err
+			}
+			defer finish()
+		}
+	}
 
 	baseCtx := ctx
 	contextTx := dbent.TxFromContext(ctx)
@@ -790,6 +816,21 @@ func decodeAccountExtraJSON(raw []byte) (any, bool, error) {
 }
 
 func (r *accountRepository) UpdateCredentials(ctx context.Context, id int64, credentials map[string]any) error {
+	if r.turnStateLifecycle != nil {
+		before, err := r.GetByID(ctx, id)
+		if err != nil {
+			return err
+		}
+		after := *before
+		after.Credentials = credentials
+		if service.OpenAITurnStateAccountChanged(before, &after) {
+			finish, err := r.beginTurnStateWrite(ctx, []int64{id})
+			if err != nil {
+				return err
+			}
+			defer finish()
+		}
+	}
 	payload, err := json.Marshal(normalizeJSONMap(credentials))
 	if err != nil {
 		return err
@@ -869,6 +910,11 @@ func (r *accountRepository) UpdateCredentials(ctx context.Context, id int64, cre
 }
 
 func (r *accountRepository) Delete(ctx context.Context, id int64) error {
+	finish, turnStateErr := r.beginTurnStateWrite(ctx, []int64{id})
+	if turnStateErr != nil {
+		return turnStateErr
+	}
+	defer finish()
 	groupIDs, err := r.loadAccountGroupIDs(ctx, id)
 	if err != nil {
 		return err
@@ -2578,6 +2624,16 @@ func (r *accountRepository) AutoPauseExpiredAccounts(ctx context.Context, now ti
 }
 
 func (r *accountRepository) UpdateExtra(ctx context.Context, id int64, updates map[string]any) error {
+	if err := r.validateTurnStateExtraPatch(ctx, []int64{id}, updates); err != nil {
+		return err
+	}
+	if turnStateExtraChanges(updates) {
+		finish, err := r.beginTurnStateWrite(ctx, []int64{id})
+		if err != nil {
+			return err
+		}
+		defer finish()
+	}
 	updates = stripCodexFingerprintSeedFromExtraUpdate(updates)
 	if len(updates) == 0 {
 		return nil
@@ -2608,6 +2664,7 @@ func (r *accountRepository) UpdateExtra(ctx context.Context, id int64, updates m
 		}
 	}
 	extraExpression := "COALESCE(extra, '{}'::jsonb) || $1::jsonb"
+	extraExpression = turnStateNestedMergeSQL(extraExpression, "$1", updates)
 	if clearProbeSnapshot {
 		extraExpression = "(" + extraExpression + ") - 'upstream_billing_probe'"
 	}
@@ -2852,6 +2909,16 @@ func ollamaCloudUsageSnapshotClearRequested(extra map[string]any) bool {
 }
 
 func (r *accountRepository) BulkUpdate(ctx context.Context, ids []int64, updates service.AccountBulkUpdate) (int64, error) {
+	if err := r.validateTurnStateExtraPatch(ctx, ids, updates.Extra); err != nil {
+		return 0, err
+	}
+	if turnStateExtraChanges(updates.Extra) || len(updates.Credentials) > 0 || updates.Status != nil {
+		finish, err := r.beginTurnStateWrite(ctx, ids)
+		if err != nil {
+			return 0, err
+		}
+		defer finish()
+	}
 	if len(ids) == 0 {
 		return 0, nil
 	}
@@ -2951,6 +3018,7 @@ func (r *accountRepository) BulkUpdate(ctx context.Context, ids []int64, updates
 				return 0, err
 			}
 			extraExpression += " || $" + itoa(idx) + "::jsonb"
+			extraExpression = turnStateNestedMergeSQL(extraExpression, "$"+itoa(idx), updates.Extra)
 			args = append(args, payload)
 			idx++
 			if upstreamBillingProbeExplicitlyDisabled(updates.Extra) || upstreamBillingProbeSnapshotClearRequested(updates.Extra) {

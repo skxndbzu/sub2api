@@ -9,13 +9,31 @@ func (s *OpenAIGatewayService) SetPluginManager(manager *PluginManager) {
 // doOpenAIUpstream 只在 OpenAI OAuth 能力绑定已启用时把真实请求交给插件。
 // 插件返回标准 http.Response，响应解析、错误映射、SSE 和计费仍由现有核心链处理。
 func (s *OpenAIGatewayService) doOpenAIUpstream(request *http.Request, proxyURL string, account *Account) (*http.Response, error) {
+	if s.turnStates != nil {
+		if prior, ok := request.Context().Value(openAITurnStateOutboundContextKey{}).(OpenAITurnStateDecision); ok {
+			if prior.Source == "probe_cache" {
+				deleteOpenAIHeaderEqualFold(request.Header, openAICodexTurnStateHeader)
+				for _, value := range prior.OriginalValues {
+					request.Header.Add(openAICodexTurnStateHeader, value)
+				}
+			}
+			s.turnStates.Resolve(request.Context(), account, prior.Key.Model, prior.Key.ServiceTier, request.Header)
+		}
+	}
 	if s.pluginManager != nil {
 		response, handled, err := s.pluginManager.RoundTripOpenAIOAuth(request.Context(), request, proxyURL, account)
 		if handled {
+			if response != nil {
+				logOpenAITurnStateResponse(request.Context(), account, response.Header, "http_plugin")
+			}
 			return response, err
 		}
 	}
-	return s.httpUpstream.Do(request, proxyURL, account.ID, account.Concurrency)
+	response, err := s.httpUpstream.Do(request, proxyURL, account.ID, account.Concurrency)
+	if response != nil {
+		logOpenAITurnStateResponse(request.Context(), account, response.Header, "http")
+	}
+	return response, err
 }
 
 // doOpenAIAccountTestUpstream 让 OpenAI OAuth 账号测试与真实转发使用同一插件路径。
@@ -26,20 +44,26 @@ func (s *AccountTestService) doOpenAIAccountTestUpstream(
 	account *Account,
 	useTLSFallback bool,
 ) (*http.Response, error) {
+	logResponse := func(response *http.Response, err error) (*http.Response, error) {
+		if response != nil {
+			logOpenAITurnStateResponse(request.Context(), account, response.Header, "account_test")
+		}
+		return response, err
+	}
 	if s.pluginManager != nil {
 		response, handled, err := s.pluginManager.RoundTripOpenAIOAuth(request.Context(), request, proxyURL, account)
 		if handled {
-			return response, err
+			return logResponse(response, err)
 		}
 	}
 	if useTLSFallback {
-		return s.httpUpstream.DoWithTLS(
+		return logResponse(s.httpUpstream.DoWithTLS(
 			request,
 			proxyURL,
 			account.ID,
 			account.Concurrency,
 			s.tlsFPProfileService.ResolveTLSProfile(account),
-		)
+		))
 	}
-	return s.httpUpstream.Do(request, proxyURL, account.ID, account.Concurrency)
+	return logResponse(s.httpUpstream.Do(request, proxyURL, account.ID, account.Concurrency))
 }

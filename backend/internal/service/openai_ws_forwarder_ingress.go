@@ -772,7 +772,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 	}
 
 	firstRoutingFields := gjson.GetManyBytes(firstPayload.payloadRaw, "model", "service_tier")
-	wsHeaders, _, buildHdrErr := s.buildOpenAIWSHeaders(
+	wsHeaders, sessionResolution, buildHdrErr := s.buildOpenAIWSHeaders(
 		ctx,
 		c,
 		account,
@@ -789,9 +789,10 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 		return fmt.Errorf("build ws headers: %w", buildHdrErr)
 	}
 	baseAcquireReq := openAIWSAcquireRequest{
-		Account: account,
-		WSURL:   wsURL,
-		Headers: wsHeaders,
+		Account:   account,
+		WSURL:     wsURL,
+		Headers:   wsHeaders,
+		TurnState: sessionResolution.TurnState,
 		HeadersFactory: func(factoryCtx context.Context, headers http.Header) (http.Header, error) {
 			return s.refreshOpenAIAgentIdentityHeaders(factoryCtx, account, headers)
 		},
@@ -1859,34 +1860,46 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 			preferredConnID = connID
 		}
 
-		nextClientMessage, readErr := readClientMessage()
-		if readErr != nil {
-			if isOpenAIWSSessionPreempted(ctx) {
-				return errOpenAIWSSessionPreempted
+		var nextPayload openAIWSClientPayload
+		for {
+			nextClientMessage, readErr := readClientMessage()
+			if readErr != nil {
+				if isOpenAIWSSessionPreempted(ctx) {
+					return errOpenAIWSSessionPreempted
+				}
+				if isOpenAIWSClientDisconnectError(readErr) {
+					closeStatus, closeReason := summarizeOpenAIWSReadCloseError(readErr)
+					logOpenAIWSModeInfo(
+						"ingress_ws_client_closed account_id=%d conn_id=%s close_status=%s close_reason=%s",
+						account.ID,
+						truncateOpenAIWSLogValue(connID, openAIWSIDValueMaxLen),
+						closeStatus,
+						truncateOpenAIWSLogValue(closeReason, openAIWSHeaderValueMaxLen),
+					)
+					return nil
+				}
+				return fmt.Errorf("read client websocket request: %w", readErr)
 			}
-			if isOpenAIWSClientDisconnectError(readErr) {
-				closeStatus, closeReason := summarizeOpenAIWSReadCloseError(readErr)
-				logOpenAIWSModeInfo(
-					"ingress_ws_client_closed account_id=%d conn_id=%s close_status=%s close_reason=%s",
-					account.ID,
-					truncateOpenAIWSLogValue(connID, openAIWSIDValueMaxLen),
-					closeStatus,
-					truncateOpenAIWSLogValue(closeReason, openAIWSHeaderValueMaxLen),
-				)
-				return nil
-			}
-			return fmt.Errorf("read client websocket request: %w", readErr)
-		}
 
-		nextPayload, parseErr := parseClientPayload(turn+1, nextClientMessage)
-		if parseErr != nil {
-			return parseErr
+			parsedNext, parseErr := parseClientPayload(turn+1, nextClientMessage)
+			if parseErr != nil {
+				return parseErr
+			}
+			nextPayload = parsedNext
+			nextRoutingFields := gjson.GetManyBytes(nextPayload.payloadRaw, "model", "service_tier")
+			if sessionResolution.TurnState.Managed && (nextRoutingFields[0].String() != sessionResolution.TurnState.Key.Model || turnStateTier(nextRoutingFields[1].String()) != sessionResolution.TurnState.Key.ServiceTier) {
+				if err := writeClientMessage(openAITurnStateWSRouteEvent); err != nil {
+					return err
+				}
+				continue
+			}
+			break
 		}
 		nextRoutingFields := gjson.GetManyBytes(nextPayload.payloadRaw, "model", "service_tier")
 		if nextPayload.promptCacheKey != "" {
 			// ingress 会话在整个客户端 WS 生命周期内复用同一上游连接；
 			// prompt_cache_key 对握手头的更新仅在未来需要重新建连时生效。
-			updatedHeaders, _, updHdrErr := s.buildOpenAIWSHeaders(
+			updatedHeaders, updatedResolution, updHdrErr := s.buildOpenAIWSHeaders(
 				ctx,
 				c,
 				account,
@@ -1903,6 +1916,7 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				logOpenAIWSModeInfo("ingress_ws_update_headers_failed account_id=%d err=%v", account.ID, updHdrErr)
 			} else {
 				baseAcquireReq.Headers = updatedHeaders
+				baseAcquireReq.TurnState = updatedResolution.TurnState
 			}
 		}
 		setOpenAICodexRoutingHint(baseAcquireReq.Headers, account, nextRoutingFields[0].String(), nextRoutingFields[1].String())

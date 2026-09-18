@@ -4,6 +4,20 @@
  */
 
 import { apiClient } from '../client'
+import type { OpenAITurnStateStatus } from '@/utils/openaiTurnState'
+
+export async function getTurnStateStatus(id: number): Promise<OpenAITurnStateStatus[]> {
+  const { data } = await apiClient.get<OpenAITurnStateStatus[]>(`/admin/accounts/${id}/turn-state/status`)
+  return data
+}
+
+export async function probeTurnState(id: number, model?: string, serviceTier?: string): Promise<void> {
+  await apiClient.post(`/admin/accounts/${id}/turn-state/probe`, { model, service_tier: serviceTier })
+}
+
+export async function clearTurnState(id: number, model?: string, serviceTier?: string): Promise<void> {
+  await apiClient.delete(`/admin/accounts/${id}/turn-state/cache`, { params: { model, service_tier: serviceTier } })
+}
 import type {
   Account,
   AccountListItem,
