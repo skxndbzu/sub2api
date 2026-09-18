@@ -53,7 +53,7 @@ coverage/
 /plugins/
 
 # Local config
-config.yaml
+backend/config.yaml
 config.local.yaml
 
 # Logs
